@@ -216,6 +216,7 @@ def _list_mcp() -> str:
         result = subprocess.run(
             claude_cmd("mcp", "list"),
             capture_output=True, text=True, timeout=10,
+            encoding='utf-8', errors='replace',
         )
         output = (result.stdout or "").strip()
         if result.returncode != 0:

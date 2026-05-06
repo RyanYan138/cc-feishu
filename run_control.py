@@ -57,14 +57,6 @@ async def stop_run(
         return False
 
     run.stop_requested = True
-    proc = run.proc
-    if proc is not None and getattr(proc, "returncode", None) is None:
-        proc.terminate()
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=grace)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
 
     if on_stopped and not run.stop_announced:
         result = on_stopped(run)

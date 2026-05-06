@@ -60,6 +60,7 @@ async def run_claude(
     cwd: Optional[str] = None,
     permission_mode: Optional[str] = None,
     on_text_chunk: Optional[Callable[[str], None]] = None,
+    on_thinking_chunk: Optional[Callable[[str], None]] = None,
     on_tool_use: Optional[Callable[[str, dict], None]] = None,
     on_process_start: Optional[Callable] = None,
 ) -> tuple[str, Optional[str], bool]:
@@ -104,6 +105,7 @@ async def run_claude(
         new_sid = None
         tool_name = ""
         tool_json = ""
+        in_thinking = False
         idle_secs = 0
 
         try:
@@ -149,10 +151,13 @@ async def run_claude(
 
                     if etype2 == "content_block_start":
                         block = evt.get("content_block", {})
-                        if block.get("type") == "tool_use":
+                        btype = block.get("type")
+                        if btype == "tool_use":
                             tool_name = block.get("name", "")
                             tool_json = ""
                             await _fire(on_tool_use, tool_name, {})
+                        elif btype == "thinking":
+                            in_thinking = True
 
                     elif etype2 == "content_block_delta":
                         delta = evt.get("delta", {})
@@ -162,10 +167,15 @@ async def run_claude(
                             if chunk:
                                 full_text += chunk
                                 await _fire(on_text_chunk, chunk)
+                        elif dtype == "thinking_delta":
+                            chunk = delta.get("thinking", "")
+                            if chunk:
+                                await _fire(on_thinking_chunk, chunk)
                         elif dtype == "input_json_delta":
                             tool_json += delta.get("partial_json", "")
 
                     elif etype2 == "content_block_stop":
+                        in_thinking = False
                         if tool_name and tool_json:
                             try:
                                 inp = json.loads(tool_json)

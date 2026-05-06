@@ -56,6 +56,7 @@ store = SessionStore()
 _active_runs = ActiveRunRegistry()
 
 _chat_locks: dict[str, asyncio.Lock] = {}
+_queue_gen: dict[str, int] = {}   # 队列代数，flush 时+1，代数不符的消息直接跳过
 _MAX_LOCKS = 200
 
 _start_time = time.time()
@@ -210,6 +211,7 @@ async def _run_and_display(
     run = _active_runs.start(user_id, card_msg_id)
 
     accumulated = ""
+    thinking = ""
     tool_lines: list[str] = []
     ask_options: list[tuple[str, str]] = []
     plan_exited = False
@@ -231,6 +233,9 @@ async def _run_and_display(
 
     def build_display() -> str:
         parts = []
+        if thinking:
+            t = thinking if len(thinking) <= 300 else thinking[-300:]
+            parts.append(f"💭 **思考中：**\n{t}")
         if tool_lines:
             parts.append("\n".join(tool_lines[-5:]))
         if accumulated:
@@ -269,8 +274,17 @@ async def _run_and_display(
             tool_lines.append(line)
         await push(build_display())
 
+    async def on_thinking(chunk: str):
+        nonlocal thinking, last_push
+        thinking += chunk
+        now = time.time()
+        if now - last_push >= _PUSH_INTERVAL:
+            await push(build_display())
+            last_push = now
+
     async def on_chunk(chunk: str):
-        nonlocal accumulated, last_push
+        nonlocal accumulated, last_push, thinking
+        thinking = ""  # 有正文输出时清空思考过程
         accumulated += chunk
         now = time.time()
         if now - last_push >= _PUSH_INTERVAL:
@@ -286,6 +300,7 @@ async def _run_and_display(
             cwd=session.cwd,
             permission_mode=session.permission_mode,
             on_text_chunk=on_chunk,
+            on_thinking_chunk=on_thinking,
             on_tool_use=on_tool,
             on_process_start=lambda proc: _active_runs.attach_proc(user_id, proc),
         )
@@ -304,6 +319,8 @@ async def _run_and_display(
         _active_runs.clear(user_id, run)
 
     final = full_text or accumulated or "（无输出）"
+    if run.stop_requested:
+        return
     if fallback:
         final = ("⚠️ 检测到工作目录已变化，旧会话无法继续，本次已自动切换到新 session。\n\n" + final)
 
@@ -386,6 +403,15 @@ async def handle_message(event: P2ImMessageReceiveV1):
                 await feishu.send_card(user_id, content=reply, loading=False)
             return
 
+        if text.strip() in ("/flush", "/clear_queue"):
+            _queue_gen[chat_id] = _queue_gen.get(chat_id, 0) + 1
+            reply = "🧹 队列已清空，等待中的消息全部丢弃。"
+            if is_group:
+                await feishu.reply_card(msg.message_id, content=reply, loading=False)
+            else:
+                await feishu.send_card(user_id, content=reply, loading=False)
+            return
+
         if text == "/":
             await _show_menu(user_id, chat_id, is_group, msg.message_id)
             return
@@ -394,13 +420,12 @@ async def handle_message(event: P2ImMessageReceiveV1):
     if is_group and not (getattr(msg, "mentions", None) or []):
         return
 
-    # 自动打断当前任务
-    active = _active_runs.get(user_id)
-    if active and not active.stop_requested:
-        print("[打断] 新消息到达，自动停止当前任务", flush=True)
-        await stop_run(_active_runs, user_id, on_stopped=_announce_interrupted)
+    # 自动打断逻辑已移除：新消息排队等待，不打断当前任务
 
+    my_gen = _queue_gen.get(chat_id, 0)
     async with _get_lock(chat_id):
+        if _queue_gen.get(chat_id, 0) != my_gen:
+            return  # 被 /flush 清掉了，直接跳过
         try:
             await _process(user_id, chat_id, is_group, msg)
         except Exception as e:
@@ -555,9 +580,6 @@ async def _handle_set_mode(user_id: str, chat_id: str, mode: str, card_msg_id: s
 
 async def _handle_btn_reply(user_id: str, chat_id: str, text: str, clicked_msg_id: str):
     is_group = chat_id != user_id
-    active = _active_runs.get(user_id)
-    if active and not active.stop_requested:
-        await stop_run(_active_runs, user_id, on_stopped=_announce_interrupted)
 
     async with _get_lock(chat_id):
         try:
@@ -738,7 +760,7 @@ class _CardHandler(BaseHTTPRequestHandler):
 # ── 后台任务 ──────────────────────────────────────────────────
 
 def _watchdog():
-    MAX_UPTIME = 4 * 3600
+    MAX_UPTIME = 12 * 3600
     while True:
         time.sleep(300)
         uptime = time.time() - _start_time
